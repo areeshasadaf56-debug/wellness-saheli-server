@@ -91,16 +91,6 @@ class PCOSOutput(BaseModel):
 
 
 def encode_binary(value: str, field_name: str) -> int:
-    """
-    Converts a 'Yes'/'No' string into the 1/0 the model expects.
-
-    Args:
-        value (str): 'Yes' or 'No' (case-insensitive).
-        field_name (str): name of the field, used only for error messages.
-
-    Returns:
-        int: 1 for Yes, 0 for No.
-    """
     normalized = value.strip().capitalize()
     if normalized not in BINARY_ENCODING:
         raise HTTPException(
@@ -111,15 +101,6 @@ def encode_binary(value: str, field_name: str) -> int:
 
 
 def encode_cycle(value: str) -> int:
-    """
-    Converts 'Regular'/'Irregular' into the 2/4 the model expects.
-
-    Args:
-        value (str): 'Regular' or 'Irregular' (case-insensitive).
-
-    Returns:
-        int: 2 for Regular, 4 for Irregular.
-    """
     normalized = value.strip().capitalize()
     if normalized not in CYCLE_ENCODING:
         raise HTTPException(
@@ -130,16 +111,6 @@ def encode_cycle(value: str) -> int:
 
 
 def build_feature_vector(data: PCOSInput) -> np.ndarray:
-    """
-    Converts the incoming request into a feature vector in the EXACT
-    order the model was trained on (FEATURE_ORDER from metadata).
-
-    Args:
-        data (PCOSInput): validated request body.
-
-    Returns:
-        numpy.ndarray: shape (1, 22), ready to be scaled and predicted on.
-    """
     bmi = data.weight_kg / ((data.height_cm / 100) ** 2)
 
     values_by_name = {
@@ -179,15 +150,6 @@ def health_check():
 
 @app.post("/predict", response_model=PCOSOutput)
 def predict(data: PCOSInput):
-    """
-    Runs the PCOS model on the submitted form data.
-
-    Args:
-        data (PCOSInput): the 22 form fields from the Flutter app.
-
-    Returns:
-        PCOSOutput: prediction label, PCOS probability, and model name.
-    """
     feature_vector = build_feature_vector(data)
     scaled_vector = scaler.transform(feature_vector)
 
@@ -203,8 +165,6 @@ def predict(data: PCOSInput):
 
 # =================================================================
 # ACCOUNTS -- /signup, /signin, /reset_password
-# Matches lib/providers/cycle_provider.dart exactly: 200 + {"name": ...}
-# on success, non-200 + {"detail": "..."} on failure.
 # =================================================================
 
 class SignUpRequest(BaseModel):
@@ -252,13 +212,6 @@ def reset_password_endpoint(data: ResetPasswordRequest):
 
 # =================================================================
 # HEALTH PROFILE -- /profile/{user_id}
-# Matches lib/services/health_profile_service.dart: GET returns the
-# HealthProfile JSON (404 if none saved yet), PUT upserts it.
-#
-# NOTE (security, see auth.py's SECURITY NOTES for the full context):
-# this endpoint is not authenticated -- anyone who knows a user_id can
-# read/overwrite that profile. Acceptable for an FYP demo, but a real
-# limitation worth naming explicitly in your report.
 # =================================================================
 
 @app.get("/profile/{user_id}")
@@ -271,8 +224,6 @@ def get_profile(user_id: str):
 
 @app.put("/profile/{user_id}")
 def put_profile(user_id: str, profile: dict):
-    # Trust the user_id in the URL, not whatever the body claims, so a
-    # mismatched payload can't silently write under the wrong id.
     profile["user_id"] = user_id
     database.upsert_profile(user_id, profile)
     return {"status": "ok"}
@@ -285,19 +236,17 @@ def put_profile(user_id: str, profile: dict):
 class ChatRequest(BaseModel):
     message: str
     history: list[dict] = []
+    profile_context: dict | None = None
 
 
 @app.post("/chat")
 def chat_endpoint(data: ChatRequest):
-    return chat.get_reply(data.message, data.history)
+    return chat.get_reply(data.message, data.history, data.profile_context)
 
 
 # =================================================================
 # CONTRACEPTIVE ELIGIBILITY -- /conditions, /methods_reference,
 # /effectiveness, /eligibility
-# See eligibility_data.py for the full explanation of what's real WHO
-# MEC data vs. what's still a curated demo subset -- READ THAT before
-# presenting /eligibility results as complete in your demo or viva.
 # =================================================================
 
 class EligibilityRequest(BaseModel):
