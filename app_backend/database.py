@@ -1,9 +1,10 @@
 """
 database.py
 
-Very small SQLite layer for the two things the app actually needs
-persisted server-side: user accounts (for cross-device sign in) and
-health profiles (for cross-device sync of the health diary).
+Very small SQLite layer for what the app needs persisted server-side:
+user accounts, health profiles, and now login sessions (so /profile
+and /chat can actually check who's asking, instead of trusting
+whatever user_id shows up in the URL).
 
 SQLite (not Postgres/MySQL/Firebase) is a deliberate choice here, not
 a shortcut:
@@ -29,8 +30,8 @@ DB_PATH = Path(__file__).parent / "wellness_saheli.db"
 
 
 def init_db() -> None:
-    """Creates the users and profiles tables if they don't exist yet.
-    Safe to call every time the app starts (CREATE TABLE IF NOT EXISTS)."""
+    """Creates all tables if they don't exist yet. Safe to call every
+    time the app starts (CREATE TABLE IF NOT EXISTS)."""
     with get_connection() as conn:
         conn.execute(
             """
@@ -51,6 +52,23 @@ def init_db() -> None:
                 last_updated TEXT NOT NULL
             )
             """
+        )
+        # Login sessions -- one row per issued token. This is what makes
+        # /profile and /chat able to check "is this actually you?"
+        # instead of trusting an unauthenticated user_id in the URL.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)"
         )
         conn.commit()
 
@@ -80,6 +98,13 @@ def get_user_by_email(email: str) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def get_user_by_id(user_id: int) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+
+
 def create_user(name: str, email: str, password_hash: str) -> sqlite3.Row:
     with get_connection() as conn:
         cur = conn.execute(
@@ -98,6 +123,46 @@ def update_password(email: str, new_password_hash: str) -> None:
             "UPDATE users SET password_hash = ? WHERE email = ?",
             (new_password_hash, email),
         )
+        conn.commit()
+
+
+# ---------------------------------------------------------------
+# Sessions (login tokens)
+# ---------------------------------------------------------------
+
+def create_session(token: str, user_id: int, expires_at_iso: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)",
+            (token, user_id, expires_at_iso),
+        )
+        # Opportunistic cleanup -- piggybacks on every login instead of
+        # needing a separate cron job for an app this size.
+        conn.execute(
+            "DELETE FROM sessions WHERE expires_at < datetime('now')"
+        )
+        conn.commit()
+
+
+def get_session(token: str) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM sessions WHERE token = ? AND expires_at > datetime('now')",
+            (token,),
+        ).fetchone()
+
+
+def delete_session(token: str) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        conn.commit()
+
+
+def delete_all_sessions_for_user(user_id: int) -> None:
+    """Used on password reset -- forces every other device/session for
+    this account to sign in again with the new password."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
         conn.commit()
 
 

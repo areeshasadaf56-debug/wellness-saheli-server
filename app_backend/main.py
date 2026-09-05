@@ -1,22 +1,29 @@
 """
 main.py
 
-FastAPI backend that serves the app-matched PCOS model
-(app_deployment/pcos_app_model.joblib) to the Flutter app.
+FastAPI backend for the Wellness Saheli Flutter app.
 
-Exposes a single POST endpoint /predict that accepts the 22 form
-fields (raw, human-readable values), applies the same scaling used
-during training, runs the model, and returns a prediction + probability.
+Exposes:
+  /predict                      -- PCOS ML prediction (stateless, public)
+  /signup, /signin, /logout,
+  /reset_password                -- accounts + session tokens
+  /profile/{user_id}             -- health profile, OWNER-ONLY (auth required)
+  /chat                          -- AI check-in, auth required (protects the
+                                     paid Groq API key from anonymous use)
+  /conditions, /methods_reference,
+  /effectiveness, /eligibility   -- contraceptive eligibility tool (stateless, public)
 
 Run from the project root:
     uvicorn app_backend.main:app --reload --host 0.0.0.0 --port 8000
 """
 
-import os
 import json
+import os
+
 import joblib
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import auth
@@ -25,6 +32,7 @@ import database
 import eligibility_data
 
 APP_DEPLOYMENT_DIR = os.path.join("app_deployment")
+MAX_PROFILE_BYTES = 300_000  # ~300 KB -- generous for the diary/profile JSON blob
 
 # ---- Load model, scaler, and metadata once at startup ----
 model = joblib.load(os.path.join(APP_DEPLOYMENT_DIR, "pcos_app_model.joblib"))
@@ -39,18 +47,50 @@ BINARY_FIELDS = metadata["categorical_encodings"]["binary_yes_no_fields"]
 BINARY_ENCODING = metadata["categorical_encodings"]["binary_encoding"]
 
 app = FastAPI(title="PCOS Detection API", version="1.0")
-from fastapi.middleware.cors import CORSMiddleware
 
+# CORS: origins are wide open ("*") deliberately, but allow_credentials
+# is OFF. Auth here is a Bearer token in the Authorization header, not
+# a cookie -- so there's no session-cookie/CSRF risk that
+# allow_credentials would normally guard against, and the previous
+# combination (allow_origins="*" + allow_credentials=True) was both
+# invalid per the CORS spec and an unnecessary risk surface.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Creates users/profiles tables on first run; a no-op after that.
+# Creates all tables on first run; a no-op after that.
 database.init_db()
+
+
+def _client_key(request: Request) -> str:
+    """Best-effort client identifier for rate limiting. Falls back to
+    a constant if the client host isn't available (e.g. some test
+    clients) -- rate limiting still applies, just shared across those
+    callers rather than being a hole."""
+    return request.client.host if request.client else "unknown"
+
+
+def get_current_user_id(
+    authorization: str | None = Header(default=None),
+) -> int:
+    """FastAPI dependency: verifies the `Authorization: Bearer <token>`
+    header and returns the signed-in user's id. Raises 401 if missing,
+    malformed, or the token is invalid/expired."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid Authorization header. Please sign in again.",
+        )
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        return auth.verify_token(token)
+    except auth.AuthError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+
 
 class PCOSInput(BaseModel):
     """
@@ -150,11 +190,19 @@ def health_check():
 
 @app.post("/predict", response_model=PCOSOutput)
 def predict(data: PCOSInput):
-    feature_vector = build_feature_vector(data)
-    scaled_vector = scaler.transform(feature_vector)
-
-    pred_class = model.predict(scaled_vector)[0]
-    pred_proba = model.predict_proba(scaled_vector)[0][1]  # probability of class 1 (PCOS)
+    try:
+        feature_vector = build_feature_vector(data)
+        scaled_vector = scaler.transform(feature_vector)
+        pred_class = model.predict(scaled_vector)[0]
+        pred_proba = model.predict_proba(scaled_vector)[0][1]  # probability of class 1 (PCOS)
+    except HTTPException:
+        raise
+    except Exception:
+        # Never leak model/library internals in the response.
+        raise HTTPException(
+            status_code=500,
+            detail="Could not process the prediction. Please check your inputs and try again.",
+        )
 
     return PCOSOutput(
         prediction="PCOS Detected" if pred_class == 1 else "No PCOS Detected",
@@ -164,7 +212,7 @@ def predict(data: PCOSInput):
 
 
 # =================================================================
-# ACCOUNTS -- /signup, /signin, /reset_password
+# ACCOUNTS -- /signup, /signin, /logout, /reset_password
 # =================================================================
 
 class SignUpRequest(BaseModel):
@@ -184,38 +232,53 @@ class ResetPasswordRequest(BaseModel):
 
 
 @app.post("/signup")
-def signup(data: SignUpRequest):
+def signup(data: SignUpRequest, request: Request):
     try:
-        name = auth.sign_up(data.name, data.email, data.password)
-        return {"name": name}
+        result = auth.sign_up(data.name, data.email, data.password, _client_key(request))
+        return result
     except auth.AuthError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
 
 @app.post("/signin")
-def signin(data: SignInRequest):
+def signin(data: SignInRequest, request: Request):
     try:
-        name = auth.sign_in(data.email, data.password)
-        return {"name": name}
+        result = auth.sign_in(data.email, data.password, _client_key(request))
+        return result
     except auth.AuthError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
+
+
+@app.post("/logout")
+def logout(authorization: str | None = Header(default=None)):
+    """Best-effort: invalidates the session if a token was sent. Always
+    returns ok so the app can clear its local state regardless."""
+    if authorization and authorization.startswith("Bearer "):
+        auth.invalidate_session(authorization.removeprefix("Bearer ").strip())
+    return {"status": "ok"}
 
 
 @app.post("/reset_password")
-def reset_password_endpoint(data: ResetPasswordRequest):
+def reset_password_endpoint(data: ResetPasswordRequest, request: Request):
     try:
-        auth.reset_password(data.email, data.new_password)
-        return {"status": "ok"}
+        auth.reset_password(data.email, data.new_password, _client_key(request))
     except auth.AuthError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
+    # Always the same generic response, whether or not the email
+    # existed -- see auth.reset_password's docstring.
+    return {"status": "ok"}
 
 
 # =================================================================
-# HEALTH PROFILE -- /profile/{user_id}
+# HEALTH PROFILE -- /profile/{user_id}  (OWNER-ONLY)
 # =================================================================
 
 @app.get("/profile/{user_id}")
-def get_profile(user_id: str):
+def get_profile(user_id: str, current_user_id: int = Depends(get_current_user_id)):
+    if str(current_user_id) != user_id:
+        raise HTTPException(
+            status_code=403, detail="You don't have permission to access this profile."
+        )
     profile = database.get_profile(user_id)
     if profile is None:
         raise HTTPException(status_code=404, detail="No profile found for this user.")
@@ -223,14 +286,26 @@ def get_profile(user_id: str):
 
 
 @app.put("/profile/{user_id}")
-def put_profile(user_id: str, profile: dict):
+def put_profile(
+    user_id: str,
+    profile: dict,
+    current_user_id: int = Depends(get_current_user_id),
+):
+    if str(current_user_id) != user_id:
+        raise HTTPException(
+            status_code=403, detail="You don't have permission to modify this profile."
+        )
+
     profile["user_id"] = user_id
+    if len(json.dumps(profile)) > MAX_PROFILE_BYTES:
+        raise HTTPException(status_code=413, detail="Profile payload is too large.")
+
     database.upsert_profile(user_id, profile)
     return {"status": "ok"}
 
 
 # =================================================================
-# AI CHECK-IN -- /chat
+# AI CHECK-IN -- /chat  (auth required)
 # =================================================================
 
 class ChatRequest(BaseModel):
@@ -240,13 +315,16 @@ class ChatRequest(BaseModel):
 
 
 @app.post("/chat")
-def chat_endpoint(data: ChatRequest):
+def chat_endpoint(
+    data: ChatRequest,
+    current_user_id: int = Depends(get_current_user_id),
+):
     return chat.get_reply(data.message, data.history, data.profile_context)
 
 
 # =================================================================
 # CONTRACEPTIVE ELIGIBILITY -- /conditions, /methods_reference,
-# /effectiveness, /eligibility
+# /effectiveness, /eligibility (stateless, no personal data -- public)
 # =================================================================
 
 class EligibilityRequest(BaseModel):
